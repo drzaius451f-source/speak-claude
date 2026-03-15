@@ -2,7 +2,7 @@
   "name": "speak-claude",
   "displayName": "Speak Claude",
   "description": "Voice-to-text input using WhisperX for VS Code and Claude Code",
-  "version": "1.0.3",
+  "version": "1.0.7",
   "publisher": "slycreator",
   "icon": "icon.png",
   "repository": {
@@ -44,8 +44,7 @@
       {
         "command": "voice-to-text.record",
         "key": "ctrl+shift+c",
-        "mac": "cmd+shift+c",
-        "when": "editorTextFocus || terminalFocus || inputFocus"
+        "mac": "cmd+shift+c"
       }
     ],
     "configuration": {

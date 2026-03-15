@@ -55,7 +55,7 @@ app.add_middleware(
 
 # Configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "int8"
+COMPUTE_TYPE = "float32" if DEVICE == "cuda" else "int8"
 BATCH_SIZE = 16 if DEVICE == "cuda" else 4
 MODEL_SIZE = os.getenv("WHISPERX_MODEL", "base")  # tiny, base, small, medium, large-v2
 HF_TOKEN = os.getenv("HF_TOKEN", None)  # Required for diarization
