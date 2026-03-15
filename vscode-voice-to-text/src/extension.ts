@@ -168,7 +168,7 @@ async function stopRecording() {
 
         const response = await axios.post(`${whisperxUrl}/transcribe`, formData, {
             headers: formData.getHeaders(),
-            timeout: 60000, // 60 second timeout
+            timeout: 300000, // 5 minute timeout (model loading can be slow on first request)
         });
 
         const transcript = response.data.transcript;
