@@ -4,9 +4,11 @@ FastAPI wrapper for m-bain/whisperx
 """
 
 import os
+import asyncio
 import tempfile
 import logging
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 # Fix for PyTorch 2.6+ weights_only default change
 # Must be set BEFORE importing torch or whisperx
@@ -62,6 +64,10 @@ HF_TOKEN = os.getenv("HF_TOKEN", None)  # Required for diarization
 
 # Global model cache
 whisper_model = None
+
+# Thread pool for CPU-bound transcription work — keeps the async event loop responsive
+# so healthchecks and other requests succeed during long transcriptions.
+_executor = ThreadPoolExecutor(max_workers=1)
 
 
 class TranscriptionResponse(BaseModel):
@@ -124,6 +130,14 @@ def format_transcript_without_speakers(segments: list) -> str:
     return " ".join(seg.get("text", "").strip() for seg in segments if seg.get("text"))
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Pre-warm the model so the first request doesn't pay cold-start cost."""
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, get_whisper_model)
+    logger.info("Model pre-loaded and ready to serve requests")
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -156,6 +170,7 @@ async def transcribe(
         "audio/mp4", "audio/m4a", "audio/x-m4a",
         "video/mp4", "video/webm", "audio/webm",
         "audio/ogg", "video/ogg",
+        "audio/flac", "audio/x-flac",
     }
 
     if file.content_type not in allowed_types:
@@ -172,57 +187,63 @@ async def transcribe(
         tmp_path = tmp.name
 
     try:
-        # Load model
-        model = get_whisper_model()
+        # Run the entire transcription pipeline in a thread so the async event
+        # loop stays responsive (healthchecks, concurrent requests, etc.).
+        loop = asyncio.get_event_loop()
 
-        # Load audio
-        logger.info(f"Loading audio from {tmp_path}")
-        audio = whisperx.load_audio(tmp_path)
+        def _transcribe_sync():
+            model = get_whisper_model()
 
-        # Transcribe
-        logger.info("Transcribing audio...")
-        result = model.transcribe(audio, batch_size=BATCH_SIZE, language=language)
-        detected_language = result.get("language", "en")
+            logger.info(f"Loading audio from {tmp_path}")
+            audio = whisperx.load_audio(tmp_path)
 
-        # Align whisper output (optional - requires NLTK)
-        if align:
-            try:
-                logger.info("Aligning transcript...")
-                model_a, metadata = whisperx.load_align_model(
-                    language_code=detected_language,
-                    device=DEVICE,
-                )
-                result = whisperx.align(
-                    result["segments"],
-                    model_a,
-                    metadata,
-                    audio,
-                    DEVICE,
-                    return_char_alignments=False,
-                )
-            except Exception as e:
-                logger.warning(f"Alignment failed: {e}. Returning unaligned transcript.")
-        else:
-            logger.info("Skipping alignment (align=False)")
+            logger.info("Transcribing audio...")
+            result = model.transcribe(audio, batch_size=BATCH_SIZE, language=language)
+            detected_language = result.get("language", "en")
 
-        has_speakers = False
+            if align:
+                try:
+                    logger.info("Aligning transcript...")
+                    model_a, metadata = whisperx.load_align_model(
+                        language_code=detected_language,
+                        device=DEVICE,
+                    )
+                    result = whisperx.align(
+                        result["segments"],
+                        model_a,
+                        metadata,
+                        audio,
+                        DEVICE,
+                        return_char_alignments=False,
+                    )
+                except Exception as e:
+                    logger.warning(f"Alignment failed: {e}. Returning unaligned transcript.")
+            else:
+                logger.info("Skipping alignment (align=False)")
 
-        # Speaker diarization (if enabled and HF_TOKEN available)
-        if diarize and HF_TOKEN:
-            try:
-                logger.info("Running speaker diarization...")
-                diarize_model = whisperx.DiarizationPipeline(
-                    use_auth_token=HF_TOKEN,
-                    device=DEVICE,
-                )
-                diarize_segments = diarize_model(audio)
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-                has_speakers = True
-                logger.info("Speaker diarization completed")
-            except Exception as e:
-                logger.warning(f"Diarization failed: {e}. Returning transcript without speakers.")
-        elif diarize and not HF_TOKEN:
-            logger.warning("Diarization requested but HF_TOKEN not set")
+            has_speakers = False
+
+            if diarize and HF_TOKEN:
+                try:
+                    logger.info("Running speaker diarization...")
+                    diarize_model = whisperx.DiarizationPipeline(
+                        use_auth_token=HF_TOKEN,
+                        device=DEVICE,
+                    )
+                    diarize_segments = diarize_model(audio)
+                    result = whisperx.assign_word_speakers(diarize_segments, result)
+                    has_speakers = True
+                    logger.info("Speaker diarization completed")
+                except Exception as e:
+                    logger.warning(f"Diarization failed: {e}. Returning transcript without speakers.")
+            elif diarize and not HF_TOKEN:
+                logger.warning("Diarization requested but HF_TOKEN not set")
+
+            return result, detected_language, has_speakers
+
+        result, detected_language, has_speakers = await loop.run_in_executor(
+            _executor, _transcribe_sync
+        )
 
         # Format transcript
         segments = result.get("segments", [])

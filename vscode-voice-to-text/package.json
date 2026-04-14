@@ -64,6 +64,11 @@
           "type": "boolean",
           "default": false,
           "description": "Enable speaker diarization (requires HF_TOKEN in WhisperX service)"
+        },
+        "voiceToText.maxRecordingSeconds": {
+          "type": "number",
+          "default": 120,
+          "description": "Maximum recording duration in seconds (0 = unlimited)"
         }
       }
     }

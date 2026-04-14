@@ -10,6 +10,11 @@ const isWindows = process.platform === 'win32';
 let recordingProcess: ChildProcess | null = null;
 let recordingFile: string | null = null;
 let statusBarItem: vscode.StatusBarItem;
+let recordingTimer: ReturnType<typeof setInterval> | null = null;
+let recordingStartTime: number = 0;
+let isTranscribing = false;
+let serviceHealthy: boolean | null = null;
+let healthCheckInterval: ReturnType<typeof setInterval> | null = null;
 
 function findSox(): string | null {
     try {
@@ -29,6 +34,76 @@ function findFfmpeg(): string | null {
     } catch {
         return null;
     }
+}
+
+async function retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    opts: { retries?: number; baseDelayMs?: number; shouldRetry?: (err: any) => boolean } = {}
+): Promise<T> {
+    const { retries = 3, baseDelayMs = 1000, shouldRetry } = opts;
+    let lastError: any;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fn();
+        } catch (err: any) {
+            lastError = err;
+            if (attempt === retries) { break; }
+            if (shouldRetry && !shouldRetry(err)) { break; }
+            const delay = baseDelayMs * Math.pow(2, attempt);
+            await new Promise(r => setTimeout(r, delay));
+        }
+    }
+    throw lastError;
+}
+
+function isValidWav(filePath: string): boolean {
+    try {
+        const fd = fs.openSync(filePath, 'r');
+        const header = Buffer.alloc(12);
+        fs.readSync(fd, header, 0, 12, 0);
+        fs.closeSync(fd);
+        return header.toString('ascii', 0, 4) === 'RIFF' && header.toString('ascii', 8, 12) === 'WAVE';
+    } catch {
+        return false;
+    }
+}
+
+function cleanupStaleTempFiles() {
+    try {
+        const tmpDir = os.tmpdir();
+        const files = fs.readdirSync(tmpDir);
+        const oneHourAgo = Date.now() - 3600000;
+        for (const f of files) {
+            if (f.startsWith('voice-') && f.endsWith('.wav')) {
+                const fullPath = path.join(tmpDir, f);
+                try {
+                    const stat = fs.statSync(fullPath);
+                    if (stat.mtimeMs < oneHourAgo) {
+                        fs.unlinkSync(fullPath);
+                    }
+                } catch { /* ignore */ }
+            }
+        }
+    } catch { /* ignore */ }
+}
+
+function startHealthMonitor() {
+    healthCheckInterval = setInterval(async () => {
+        if (recordingProcess || isTranscribing) { return; }
+        const healthy = await checkServiceHealth();
+        if (serviceHealthy === true && !healthy) {
+            statusBarItem.text = '$(warning) Speak Claude';
+            statusBarItem.tooltip = 'WhisperX service is unavailable';
+            statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+        } else if (healthy && serviceHealthy !== true) {
+            if (!recordingProcess && !isTranscribing) {
+                statusBarItem.text = '$(unmute) Speak Claude';
+                statusBarItem.tooltip = 'Click to start voice recording (Ctrl+Shift+C)';
+                statusBarItem.backgroundColor = undefined;
+            }
+        }
+        serviceHealthy = healthy;
+    }, 30000);
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -54,10 +129,34 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     context.subscriptions.push(disposable);
+
+    // Cleanup stale temp files from previous sessions and start background health monitoring
+    cleanupStaleTempFiles();
+    startHealthMonitor();
+}
+
+async function checkServiceHealth(): Promise<boolean> {
+    const config = vscode.workspace.getConfiguration('voiceToText');
+    const whisperxUrl = config.get<string>('whisperxUrl', 'http://localhost:48001');
+    try {
+        const resp = await axios.get(`${whisperxUrl}/health`, { timeout: 3000 });
+        return resp.data.status === 'healthy';
+    } catch {
+        return false;
+    }
 }
 
 async function startRecording() {
     try {
+        // Check service health before recording so the user doesn't waste time
+        const healthy = await checkServiceHealth();
+        if (!healthy) {
+            vscode.window.showErrorMessage(
+                'WhisperX service is not running or not ready. Start it with: cd whisperx-service && uvicorn main:app --port 48001'
+            );
+            return;
+        }
+
         // Check if sox is installed
         const soxPath = findSox();
         if (!soxPath) {
@@ -74,16 +173,41 @@ async function startRecording() {
             : ['-d', '-r', '16000', '-c', '1', '-b', '16', recordingFile];
         recordingProcess = spawn(soxPath, soxArgs, { windowsHide: true });
 
-        // Update status bar
-        statusBarItem.text = '$(mic) Recording...';
+        // Update status bar with live elapsed timer
         statusBarItem.tooltip = 'Click to stop recording (Ctrl+Shift+C)';
         statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+        recordingStartTime = Date.now();
+        statusBarItem.text = '$(mic) 0:00';
+        recordingTimer = setInterval(() => {
+            const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+            const mins = Math.floor(elapsed / 60);
+            const secs = elapsed % 60;
+            statusBarItem.text = `$(mic) ${mins}:${secs.toString().padStart(2, '0')}`;
 
-        vscode.window.showInformationMessage('🎤 Recording... Click the status bar button again to stop');
+            // Auto-stop at max duration
+            const config = vscode.workspace.getConfiguration('voiceToText');
+            const maxSeconds = config.get<number>('maxRecordingSeconds', 120);
+            if (maxSeconds > 0 && elapsed >= maxSeconds) {
+                vscode.window.showWarningMessage(`Recording stopped: ${maxSeconds}s limit reached`);
+                stopRecording();
+            }
+        }, 1000);
+
+        vscode.window.showInformationMessage('Recording... Click the status bar button again to stop');
 
         recordingProcess.on('error', (err) => {
             vscode.window.showErrorMessage(`Recording failed: ${err.message}`);
             resetRecordingState();
+        });
+
+        recordingProcess.on('exit', (code, _signal) => {
+            // If SoX exits unexpectedly while we still think we're recording
+            if (recordingProcess !== null && code !== null && code !== 0) {
+                vscode.window.showErrorMessage(
+                    `Recording stopped unexpectedly (exit code ${code}). Check your audio device.`
+                );
+                resetRecordingState();
+            }
         });
 
     } catch (error: any) {
@@ -112,6 +236,13 @@ async function stopRecording() {
         return;
     }
 
+    // Prevent concurrent transcriptions
+    if (isTranscribing) {
+        vscode.window.showWarningMessage('A transcription is already in progress. Please wait.');
+        return;
+    }
+    isTranscribing = true;
+
     // Stop recording — on Windows SIGINT doesn't flush the WAV file, so just kill
     if (isWindows) {
         recordingProcess.kill();
@@ -120,9 +251,14 @@ async function stopRecording() {
     }
     recordingProcess = null;
 
-    // Update status bar to show processing
+    // Update status bar to show processing with elapsed timer
+    const transcribeStart = Date.now();
     statusBarItem.text = '$(loading~spin) Transcribing...';
     statusBarItem.tooltip = 'Processing audio...';
+    const transcribeTimer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - transcribeStart) / 1000);
+        statusBarItem.text = `$(loading~spin) Transcribing (${elapsed}s)...`;
+    }, 1000);
 
     try {
         // Wait for file to be written — longer on Windows since kill() is abrupt
@@ -146,7 +282,19 @@ async function stopRecording() {
                 } catch {
                     // If ffmpeg fails, proceed with original file
                 }
+            } else {
+                // No ffmpeg on Windows — WAV header is likely corrupt from abrupt kill
+                if (!isValidWav(recordingFile)) {
+                    throw new Error(
+                        'Audio file is corrupt (WAV header invalid). Install ffmpeg to fix this automatically on Windows.'
+                    );
+                }
             }
+        }
+
+        // Validate WAV before sending to avoid a wasted 5-minute timeout
+        if (!isValidWav(recordingFile)) {
+            throw new Error('Audio file is corrupt (invalid WAV header). Try recording again.');
         }
 
         // Send to WhisperX service
@@ -155,21 +303,35 @@ async function stopRecording() {
         const language = config.get<string>('language', '');
         const diarization = config.get<boolean>('diarization', false);
 
-        const formData = new FormData();
-        formData.append('file', fs.createReadStream(recordingFile), {
-            filename: 'recording.wav',
-            contentType: 'audio/wav'
-        });
-        formData.append('diarize', String(diarization));
-        formData.append('align', 'true');
-        if (language) {
-            formData.append('language', language);
-        }
+        // Read file into buffer once so retries don't fail on consumed streams
+        const fileBuffer = fs.readFileSync(recordingFile);
 
-        const response = await axios.post(`${whisperxUrl}/transcribe`, formData, {
-            headers: formData.getHeaders(),
-            timeout: 300000, // 5 minute timeout (model loading can be slow on first request)
-        });
+        const response = await retryWithBackoff(
+            () => {
+                const formData = new FormData();
+                formData.append('file', fileBuffer, {
+                    filename: 'recording.wav',
+                    contentType: 'audio/wav'
+                });
+                formData.append('diarize', String(diarization));
+                formData.append('align', 'true');
+                if (language) {
+                    formData.append('language', language);
+                }
+                return axios.post(`${whisperxUrl}/transcribe`, formData, {
+                    headers: formData.getHeaders(),
+                    timeout: 300000,
+                });
+            },
+            {
+                retries: 3,
+                baseDelayMs: 1000,
+                shouldRetry: (err: any) => {
+                    if (!err.response) { return true; } // network error — retry
+                    return err.response.status >= 500;   // server error — retry
+                },
+            }
+        );
 
         const transcript = response.data.transcript;
 
@@ -180,20 +342,23 @@ async function stopRecording() {
         // Insert text into active editor or input
         await insertText(transcript.trim());
 
-        vscode.window.showInformationMessage(`✅ Transcribed: "${transcript.substring(0, 50)}${transcript.length > 50 ? '...' : ''}"`);
+        vscode.window.showInformationMessage(`Transcribed: "${transcript.substring(0, 50)}${transcript.length > 50 ? '...' : ''}"`);
 
     } catch (error: any) {
-        if (error.code === 'ECONNREFUSED') {
+        if (error.code === 'ECONNREFUSED' || error.code === 'ECONNRESET') {
+            serviceHealthy = false;
             vscode.window.showErrorMessage(
-                `WhisperX service is not running. Start it with: cd whisperx-service && uvicorn main:app --port 48001`
+                'WhisperX service connection lost. It may have restarted. Please try again in a moment.'
             );
         } else {
             vscode.window.showErrorMessage(`Transcription failed: ${error.message}`);
         }
     } finally {
+        isTranscribing = false;
+        clearInterval(transcribeTimer);
         // Cleanup
         if (recordingFile && fs.existsSync(recordingFile)) {
-            fs.unlinkSync(recordingFile);
+            try { fs.unlinkSync(recordingFile); } catch { /* ignore */ }
         }
         resetRecordingState();
     }
@@ -295,16 +460,20 @@ function findPython(): string | null {
 function resetRecordingState() {
     recordingProcess = null;
     recordingFile = null;
+    isTranscribing = false;
+    if (recordingTimer) { clearInterval(recordingTimer); recordingTimer = null; }
     statusBarItem.text = '$(unmute) Speak Claude';
     statusBarItem.tooltip = 'Click to start voice recording (Ctrl+Shift+C)';
     statusBarItem.backgroundColor = undefined;
 }
 
 export function deactivate() {
+    if (healthCheckInterval) { clearInterval(healthCheckInterval); }
+    if (recordingTimer) { clearInterval(recordingTimer); }
     if (recordingProcess) {
-        recordingProcess.kill();
+        try { recordingProcess.kill(); } catch { /* already dead */ }
     }
     if (recordingFile && fs.existsSync(recordingFile)) {
-        fs.unlinkSync(recordingFile);
+        try { fs.unlinkSync(recordingFile); } catch { /* ignore */ }
     }
 }

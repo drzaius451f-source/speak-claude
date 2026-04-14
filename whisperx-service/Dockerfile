@@ -30,11 +30,11 @@ COPY . .
 RUN mkdir -p /root/.cache/huggingface
 
 # Expose port
-EXPOSE 8001
+EXPOSE 48001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8001/health || exit 1
+# Health check — start-period covers model download + load on first boot
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
+    CMD curl -f http://localhost:48001/health || exit 1
 
 # Run the service
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "48001", "--timeout-keep-alive", "300"]
